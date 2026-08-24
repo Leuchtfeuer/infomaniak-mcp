@@ -154,7 +154,7 @@ test("MailApiService maps folder paths to API folder ids when listing messages",
   assert.equal(result.total, 100);
   assert.deepEqual(result.messages, [
     {
-      uid: "555",
+      uid: "555@inbox-id",
       subject: "API mail",
       from: "Ada <ada@example.com>",
       date: "2026-05-10T10:00:00Z",
@@ -285,14 +285,14 @@ test("MailApiService queries filtered message summaries with an opaque cursor", 
   const firstPage = await mail.queryMessages({ folder: "Inbox", query: "build", unread: true, limit: 1 });
 
   assert.equal(firstPage.messages.length, 1);
-  assert.equal(firstPage.messages[0].uid, "1");
+  assert.equal(firstPage.messages[0].uid, "1@inbox-id");
   assert.match(firstPage.nextCursor, /^[A-Za-z0-9_-]+$/);
   assert.equal(firstPage.scannedCount, 2);
 
   const secondPage = await mail.queryMessages({ cursor: firstPage.nextCursor });
 
   assert.equal(secondPage.messages.length, 1);
-  assert.equal(secondPage.messages[0].uid, "3");
+  assert.equal(secondPage.messages[0].uid, "3@inbox-id");
   assert.equal(secondPage.nextCursor, undefined);
 });
 
@@ -377,8 +377,8 @@ test("MailApiService query cursors anchor pagination when new mail arrives", asy
   const firstPage = await mail.queryMessages({ folder: "Inbox", query: "build", limit: 1 });
   const secondPage = await mail.queryMessages({ cursor: firstPage.nextCursor });
 
-  assert.equal(firstPage.messages[0].uid, "1");
-  assert.equal(secondPage.messages[0].uid, "2");
+  assert.equal(firstPage.messages[0].uid, "1@inbox-id");
+  assert.equal(secondPage.messages[0].uid, "2@inbox-id");
   assert.equal(secondPage.nextCursor, undefined);
 });
 
@@ -762,11 +762,11 @@ test("MailApiService searches message summaries by sender without IMAP", async (
   const results = await mail.searchMessages("Inbox", "ada@example.com", 10);
 
   assert.deepEqual(results, [
-    { uid: "2", subject: "Invoice", from: "Ada <ada@example.com>", date: "2026-05-01T10:00:00Z" },
+    { uid: "2@inbox-id", subject: "Invoice", from: "Ada <ada@example.com>", date: "2026-05-01T10:00:00Z" },
   ]);
 });
 
-test("MailApiService strips the folder suffix from message UIDs when reading", async () => {
+test("MailApiService reads a message from the folder encoded in its UID", async () => {
   const calls = [];
   const fetchImpl = async (url, options) => {
     calls.push({ url, options });
@@ -779,20 +779,77 @@ test("MailApiService strips the folder suffix from message UIDs when reading", a
     if (url.endsWith("/mail/mailbox-1/folder?with=ik-static")) {
       return jsonResponse({
         result: "success",
-        data: [{ id: "inbox-id", name: "Inbox", role: "INBOX", children: [] }],
+        data: [
+          { id: "inbox-id", name: "Inbox", role: "INBOX", children: [] },
+          { id: "archive-id", name: "Archive", role: "ARCHIVE", children: [] },
+        ],
       });
     }
-    if (url.endsWith("/mail/mailbox-1/folder/inbox-id/message/555?prefered_format=html&with=auto_uncrypt,thread_context")) {
+    if (url.includes("/mail/mailbox-1/folder/archive-id/message/555?prefered_format=plain")) {
       return jsonResponse({
         result: "success",
         data: {
-          uid: "555@inbox-id",
+          uid: "555@archive-id",
           msg_id: "<message@example.com>",
           subject: "Readable",
           from: [{ name: "Ada", email: "ada@example.com" }],
           to: [{ name: "Grace", email: "grace@example.com" }],
-          body: "Plain text",
-          html: "<p>Plain text</p>",
+          body: { value: "Plain text", type: "text/plain" },
+        },
+      });
+    }
+    if (url.includes("/mail/mailbox-1/folder/archive-id/message/555?prefered_format=html")) {
+      return jsonResponse({
+        result: "success",
+        data: { uid: "555@archive-id", body: { value: "<p>Plain text</p>", type: "text/html" } },
+      });
+    }
+    throw new Error(`Unexpected URL ${url}`);
+  };
+
+  const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
+  const message = await mail.readMessage("Inbox", "555@archive-id", "mailbox-1");
+
+  assert.equal(message.subject, "Readable");
+  assert.equal(message.messageId, "<message@example.com>");
+  assert.equal(message.text, "Plain text");
+  assert.equal(message.html, "<p>Plain text</p>");
+  assert.ok(calls.some((call) => call.url.endsWith("/folder/archive-id/message/555?prefered_format=plain&with=auto_uncrypt,thread_context")));
+  assert.equal(calls.some((call) => call.url.includes("/folder/inbox-id/message/")), false);
+});
+
+test("MailApiService keeps the newest thread message in list summaries", async () => {
+  const fetchImpl = async (url) => {
+    if (url.endsWith("/mailbox?with=aliases,permissions,accountId,count_users")) {
+      return jsonResponse({
+        result: "success",
+        data: [{ uuid: "mailbox-1", email: "user@example.com", mailbox: "user" }],
+      });
+    }
+    if (url.endsWith("/mail/mailbox-1/folder?with=ik-static")) {
+      return jsonResponse({
+        result: "success",
+        data: [{ id: "inbox-id", name: "Inbox", role: "INBOX", children: [] }],
+      });
+    }
+    if (url.includes("/mail/mailbox-1/folder/inbox-id/message?offset=0")) {
+      return jsonResponse({
+        result: "success",
+        data: {
+          count: 1,
+          threads: [
+            {
+              uid: "thread-1",
+              subject: "Quote",
+              from: [{ name: "Ada", email: "ada@example.com" }],
+              date: "2026-05-10T10:00:00Z",
+              messages_count: 2,
+              messages: [
+                { uid: "1@inbox-id", date: "2026-05-09T08:00:00Z", from: [{ name: "Ada", email: "ada@example.com" }], preview: "Could you send a quote?" },
+                { uid: "9@sent-id", date: "2026-05-11T09:00:00Z", from: [{ name: "Grace", email: "grace@example.com" }], preview: "Quote attached." },
+              ],
+            },
+          ],
         },
       });
     }
@@ -800,11 +857,13 @@ test("MailApiService strips the folder suffix from message UIDs when reading", a
   };
 
   const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
-  const message = await mail.readMessage("Inbox", "555@inbox-id", "mailbox-1");
+  const result = await mail.listMessages("Inbox", 25, 1);
 
-  assert.equal(message.subject, "Readable");
-  assert.equal(message.messageId, "<message@example.com>");
-  assert.ok(calls.some((call) => call.url.endsWith("/message/555?prefered_format=html&with=auto_uncrypt,thread_context")));
+  assert.equal(result.messages[0].uid, "9@sent-id");
+  assert.equal(result.messages[0].from, "Grace <grace@example.com>");
+  assert.equal(result.messages[0].preview, "Quote attached.");
+  assert.equal(result.messages[0].date, "2026-05-10T10:00:00Z");
+  assert.equal(result.messages[0].lastMessageDate, "2026-05-11T09:00:00Z");
 });
 
 test("MailApiService sends plain mail through the draft API", async () => {
@@ -923,8 +982,8 @@ test("MailApiService finds messages from a sender across selected folders", asyn
     folderPath: message.folderPath,
     subject: message.subject,
   })), [
-    { uid: "1", folderId: "inbox-id", folderPath: "Inbox", subject: "Invoice" },
-    { uid: "3", folderId: "archive-id", folderPath: "Archive", subject: "Receipt" },
+    { uid: "1@inbox-id", folderId: "inbox-id", folderPath: "Inbox", subject: "Invoice" },
+    { uid: "3@archive-id", folderId: "archive-id", folderPath: "Archive", subject: "Receipt" },
   ]);
   assert.equal(calls.some((call) => call.url.includes("/folder/trash-id/message?")), false);
 });

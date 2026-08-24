@@ -45,6 +45,9 @@ export interface MailMessageSummary {
   subject: string;
   from: string;
   date: string;
+  // Set when the newest message of the thread lives outside the queried folder,
+  // e.g. an own reply in Sent. date stays the folder-local date the server sorts by.
+  lastMessageDate?: string;
   flags: string[];
   size?: number;
   preview?: string;

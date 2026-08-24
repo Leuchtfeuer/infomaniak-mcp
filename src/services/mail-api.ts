@@ -74,6 +74,8 @@ interface RawAddress {
 
 interface RawThreadMessage {
   uid?: MailUid;
+  date?: string;
+  from?: RawAddress[];
   preview?: string;
   flags?: string[];
   seen?: boolean;
@@ -104,8 +106,7 @@ interface RawMessage {
   cc?: RawAddress[];
   bcc?: RawAddress[];
   date?: string;
-  body?: string;
-  html?: string;
+  body?: string | RawBody;
   preview?: string;
   has_attachments?: boolean;
   attachments?: RawAttachment[];
@@ -113,6 +114,11 @@ interface RawMessage {
   flagged?: boolean;
   folder?: unknown;
   headers?: unknown;
+}
+
+interface RawBody {
+  value?: string;
+  type?: string;
 }
 
 interface RawAttachment {
@@ -326,17 +332,25 @@ export class MailApiService implements Partial<MailToolService> {
     options: MailReadOptions = {}
   ): Promise<MailReadMessageResult> {
     const uuid = await this.resolveMailboxUuid(mailboxUuid);
-    const folderId = await this.resolveFolderId(uuid, folder);
+    const folderId = toApiFolderId(uid) ?? (await this.resolveFolderId(uuid, folder));
     const includeThreadContext = options.includeThreadContext ?? true;
     const includeHeaders = options.includeHeaders ?? true;
     const includeBody = options.includeBody ?? true;
     const bodyFormat = options.bodyFormat ?? "both";
-    const preferredFormat = bodyFormat === "text" ? "plain" : "html";
+    const preferredFormat = bodyFormat === "html" ? "html" : "plain";
     const withValues = ["auto_uncrypt", ...(includeThreadContext ? ["thread_context"] : [])];
+    const messagePath = `/mail/${encodeURIComponent(uuid)}/folder/${encodeURIComponent(folderId)}/message/${encodeURIComponent(toApiMessageId(uid))}`;
     const response = await this.apiRequest<RawMessage>(
-      `/mail/${encodeURIComponent(uuid)}/folder/${encodeURIComponent(folderId)}/message/${encodeURIComponent(toApiMessageId(uid))}?prefered_format=${preferredFormat}&with=${withValues.join(",")}`
+      `${messagePath}?prefered_format=${preferredFormat}&with=${withValues.join(",")}`
     );
     const message = response.data ?? {};
+    // One request carries one format only, so "both" needs the HTML variant on top.
+    const primaryBody = readApiBody(message.body);
+    let alternateBody = "";
+    if (includeBody && bodyFormat === "both") {
+      const alternate = await this.apiRequest<RawMessage>(`${messagePath}?prefered_format=html&with=auto_uncrypt`);
+      alternateBody = readApiBody(alternate.data?.body).value;
+    }
     return {
       subject: message.subject ?? "(no subject)",
       from: formatAddresses(message.from),
@@ -345,8 +359,8 @@ export class MailApiService implements Partial<MailToolService> {
       bcc: formatAddressList(message.bcc),
       date: message.date ?? "",
       messageId: message.msg_id ?? message.message_id ?? String(message.uid ?? ""),
-      text: includeBody && bodyFormat !== "html" ? truncateBody(message.body ?? "", options.maxBodyChars) : "",
-      html: includeBody && bodyFormat !== "text" ? truncateBody(message.html ?? "", options.maxBodyChars) : "",
+      text: includeBody && bodyFormat !== "html" && !primaryBody.isHtml ? truncateBody(primaryBody.value, options.maxBodyChars) : "",
+      html: includeBody && bodyFormat !== "text" ? truncateBody(primaryBody.isHtml ? primaryBody.value : alternateBody, options.maxBodyChars) : "",
       attachments: summarizeApiAttachments(message),
       preview: message.preview,
       seen: message.seen,
@@ -376,7 +390,7 @@ export class MailApiService implements Partial<MailToolService> {
     }
 
     const uuid = await this.resolveMailboxUuid(mailboxUuid);
-    const folderId = await this.resolveFolderId(uuid, folder);
+    const folderId = toApiFolderId(uid) ?? (await this.resolveFolderId(uuid, folder));
     const raw = await this.downloadRaw(
       `/mail/${encodeURIComponent(uuid)}/folder/${encodeURIComponent(folderId)}/message/${encodeURIComponent(toApiMessageId(uid))}/attachment/${encodeURIComponent(attachment.id)}`
     );
@@ -513,7 +527,7 @@ export class MailApiService implements Partial<MailToolService> {
       throw new Error(`Bulk delete confirmation must exactly equal: ${preview.confirmationPhrase}`);
     }
 
-    const uids = preview.messages.map((message) => String(message.uid));
+    const uids = preview.messages.map((message) => toApiMessageId(message.uid));
     await this.postMessageAction(preview.mailboxUuid, "move", { uids, to: preview.targetFolderId });
     this.invalidateMailboxCaches(preview.mailboxUuid);
 
@@ -1236,25 +1250,37 @@ function flattenFolders(folders: RawFolder[], prefix = ""): MailFolder[] {
 }
 
 function mapThread(thread: RawThread): MailMessageSummary {
-  const firstMessage = thread.messages?.[0];
+  // thread.date is the newest message, so preview, sender and uid have to come from
+  // that same message. thread.messages is ordered oldest first.
+  const latestMessage = pickLatestThreadMessage(thread.messages);
   const message: MailMessageSummary = {
-    uid: toApiMessageId(firstMessage?.uid ?? thread.uid ?? ""),
+    uid: latestMessage?.uid ?? thread.uid ?? "",
     subject: thread.subject ?? "(no subject)",
-    from: formatAddresses(thread.from),
+    from: formatAddresses(latestMessage?.from ?? thread.from),
     date: thread.date ?? "",
-    flags: firstMessage?.flags ?? [],
-    preview: firstMessage?.preview ?? "",
+    flags: latestMessage?.flags ?? [],
+    preview: latestMessage?.preview ?? "",
     threadUid: thread.uid,
     messagesCount: thread.messages_count,
     unseenMessages: thread.unseen_messages,
   };
-  const seen = firstMessage?.seen ?? thread.seen;
-  const flagged = firstMessage?.flagged ?? thread.flagged;
-  const hasAttachments = firstMessage?.has_attachments ?? thread.has_attachments;
+  if (latestMessage?.date && latestMessage.date !== thread.date) {
+    message.lastMessageDate = latestMessage.date;
+  }
+  const seen = latestMessage?.seen ?? thread.seen;
+  const flagged = latestMessage?.flagged ?? thread.flagged;
+  const hasAttachments = latestMessage?.has_attachments ?? thread.has_attachments;
   if (seen !== undefined) message.seen = seen;
   if (flagged !== undefined) message.flagged = flagged;
   if (hasAttachments !== undefined) message.hasAttachments = hasAttachments;
   return message;
+}
+
+function pickLatestThreadMessage(messages?: RawThreadMessage[]): RawThreadMessage | undefined {
+  if (!messages?.length) return undefined;
+  return messages.reduce((latest, candidate) =>
+    (Date.parse(candidate.date ?? "") || 0) >= (Date.parse(latest.date ?? "") || 0) ? candidate : latest
+  );
 }
 
 interface MailQueryFilters {
@@ -1409,6 +1435,20 @@ function toRecipient(email: string): { name: string; email: string } {
 
 function toApiMessageId(uid: MailUid): string {
   return String(uid).split("@", 1)[0];
+}
+
+// The Mail API returns the body as { value, type }, not as a plain string.
+function readApiBody(body: RawMessage["body"]): { value: string; isHtml: boolean } {
+  if (typeof body === "string") return { value: body, isHtml: false };
+  return { value: body?.value ?? "", isHtml: (body?.type ?? "").includes("html") };
+}
+
+// Mail API UIDs are "<messageId>@<folderId>". The folder part addresses the message
+// exactly, so it wins over whatever folder the caller passed in.
+function toApiFolderId(uid: MailUid): string | undefined {
+  const raw = String(uid);
+  const separator = raw.indexOf("@");
+  return separator === -1 ? undefined : raw.slice(separator + 1) || undefined;
 }
 
 function requireMailboxHosting(mailbox: MailboxSummary): MailboxSummary & { hostingId: number; mailbox: string } {
