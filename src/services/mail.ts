@@ -59,6 +59,8 @@ export interface MailMessageSummary {
   hasAttachments?: boolean;
   folderId?: string;
   folderPath?: string;
+  messageId?: string;
+  mailboxUuid?: string;
 }
 
 export interface MailListMessagesResult {
@@ -104,6 +106,19 @@ export interface MailQueryParams {
   dateTo?: string;
   limit?: number;
   cursor?: string;
+  // Search every folder of the mailbox in one call; folder is then only the request anchor.
+  allFolders?: boolean;
+  // Query several mailboxes; limit applies per mailbox and the results are merged by date.
+  allMailboxes?: boolean;
+  mailboxUuids?: string[];
+}
+
+export interface MailQueryMailboxResult {
+  mailboxUuid: string;
+  mailboxEmail?: string;
+  total: number;
+  scannedCount: number;
+  nextCursor?: string;
 }
 
 export interface MailQueryResult {
@@ -115,6 +130,8 @@ export interface MailQueryResult {
   total: number;
   scannedCount: number;
   nextCursor?: string;
+  allFolders?: boolean;
+  mailboxes?: MailQueryMailboxResult[];
 }
 
 export interface SendMessageParams {

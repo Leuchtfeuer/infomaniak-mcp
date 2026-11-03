@@ -2,7 +2,15 @@
 
 ## Unreleased
 
-No changes yet.
+### Added
+- Calendar: `calendar_list_events` returns `organizer`, `attendees[]` (address, name, state) and `my_response` by requesting `with=attendees`; new `query` text filter, `fields` raw-field selection and `all_calendars` switch
+- Calendar: `calendar_get_event` fetches one event with every field via `/1/calendar/pim/event/{id}`
+- Mail: `mail_query` accepts `all_folders` (one search across the mailbox, copies collapsed by Message-ID), `all_mailboxes` and `mailbox_uuids` (merged by date, per-mailbox cursors in `mailboxes[]`)
+
+### Changed
+- Calendar: `calendar_list_events` defaults to the user's own calendar and returns a compact event (no `raw`, `alarms`, `attachments`; description cut at 400 characters with `description_truncated`)
+- Calendar: `calendar_update_event` loads the event by ID instead of scanning event lists across calendars
+- Mail: `mail_query` sends `sender`, `query` (now full text over subject and body) and `has_attachment=true` to the server; `date_from` stops paging once older mail is reached
 
 ## [1.1.0] - 2026-07-28
 

@@ -28,18 +28,36 @@ export function registerCalendarTools(server: McpServer, calendar: CalendarServi
   registerStructuredTool(
     server,
     "calendar_list_events",
-    "List calendar events in a date range. Dates should be ISO 8601 format.",
+    "List calendar events in a date range. Dates should be ISO 8601 format. Returns compact events with organizer, attendees (address, name, state) and my_response (the user's own reply state); descriptions are cut at 400 characters. Defaults to the user's own calendar.",
     {
       from: z.string().describe("Start date/time (ISO 8601, e.g. 2025-01-15T09:00:00)"),
       to: z.string().describe("End date/time (ISO 8601, e.g. 2025-01-15T18:00:00)"),
-      calendar_id: z.string().optional().describe("Calendar ID (omit for all calendars)"),
+      calendar_id: z.string().optional().describe("Calendar ID (defaults to the user's own calendar)"),
+      all_calendars: z.boolean().optional().describe("Set true to include every visible calendar (colleagues, rooms). Ignored when calendar_id is given."),
+      query: z.string().optional().describe("Case-insensitive text filter on title, description and location."),
+      fields: z.array(z.string()).optional().describe("Return only these raw API fields (plus id) instead of the compact event, e.g. [\"title\", \"description\"]."),
     },
     readOnlyTool,
-    async ({ from, to, calendar_id }) => {
-      const events = await calendar.listEvents(from, to, calendar_id);
+    async ({ from, to, calendar_id, all_calendars, query, fields }) => {
+      const events = await calendar.listEvents(from, to, { calendarId: calendar_id, allCalendars: all_calendars, query, fields });
       return withUntrustedContent(jsonResult(events), "calendar", ["title", "description", "location", "attendees"]);
     },
     calendarEventArrayOutputSchema
+  );
+
+  registerStructuredTool(
+    server,
+    "calendar_get_event",
+    "Get one calendar event by ID with all fields, including attendees with their reply state and the organizer.",
+    {
+      event_id: z.string().describe("Event ID"),
+    },
+    readOnlyTool,
+    async ({ event_id }) => {
+      const event = await calendar.getEvent(event_id);
+      return withUntrustedContent(jsonResult(event), "calendar", ["title", "description", "location", "attendees"]);
+    },
+    objectOutputSchema
   );
 
   registerStructuredTool(
