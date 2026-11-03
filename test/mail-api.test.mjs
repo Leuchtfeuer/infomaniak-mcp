@@ -236,7 +236,8 @@ test("MailApiService queries filtered message summaries with an opaque cursor", 
         data: [{ id: "inbox-id", name: "Inbox", role: "inbox", children: [] }],
       });
     }
-    if (url.endsWith("/mail/mailbox-1/folder/inbox-id/message?offset=0&thread=on&severywhere=0&limit=20")) {
+    // The server applies scontains itself, so only matching threads come back.
+    if (url.endsWith("/mail/mailbox-1/folder/inbox-id/message?offset=0&thread=on&severywhere=0&limit=20&scontains=build")) {
       return jsonResponse({
         result: "success",
         data: {
@@ -250,19 +251,11 @@ test("MailApiService queries filtered message summaries with an opaque cursor", 
               seen: false,
               messages: [{ uid: "1@inbox-id", preview: "Slow test details", flags: [] }],
             },
-            {
-              uid: "thread-2",
-              subject: "Lunch",
-              from: [{ name: "Ada", email: "ada@example.com" }],
-              date: "2026-06-01T09:00:00Z",
-              seen: false,
-              messages: [{ uid: "2@inbox-id", preview: "Cafe?", flags: [] }],
-            },
           ],
         },
       });
     }
-    if (url.endsWith("/mail/mailbox-1/folder/inbox-id/message?offset=20&thread=on&severywhere=0&limit=20")) {
+    if (url.endsWith("/mail/mailbox-1/folder/inbox-id/message?offset=20&thread=on&severywhere=0&limit=20&scontains=build")) {
       return jsonResponse({
         result: "success",
         data: {
@@ -287,7 +280,7 @@ test("MailApiService queries filtered message summaries with an opaque cursor", 
   assert.equal(firstPage.messages.length, 1);
   assert.equal(firstPage.messages[0].uid, "1@inbox-id");
   assert.match(firstPage.nextCursor, /^[A-Za-z0-9_-]+$/);
-  assert.equal(firstPage.scannedCount, 2);
+  assert.equal(firstPage.scannedCount, 1);
 
   const secondPage = await mail.queryMessages({ cursor: firstPage.nextCursor });
 
@@ -1291,4 +1284,137 @@ test("HybridMailService prefers the Mail API for attachment sends when supported
   assert.deepEqual(apiCalls, [["listMessages", "Inbox", 10, 1], ["sendMessage"]]);
   assert.deepEqual(smtpCalls, []);
   assert.deepEqual(sent, { messageId: "api-message" });
+});
+
+function thread(uid, subject, date, extra = {}) {
+  const { from = "ci@example.com", preview = "", folderId = "inbox-id", folder = "INBOX", msgId } = extra;
+  return {
+    uid: `thread-${uid}`,
+    subject,
+    from: [{ name: "", email: from }],
+    date,
+    messages: [{ uid: `${uid}@${folderId}`, preview, flags: [], folder_id: folderId, folder, msg_id: msgId ?? `<${uid}@example.com>` }],
+  };
+}
+
+function queryFetch({ mailboxes, listings }) {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push(url);
+    if (url.endsWith("/mailbox?with=aliases,permissions,accountId,count_users")) {
+      return jsonResponse({ result: "success", data: mailboxes });
+    }
+    if (/\/mail\/[^/]+\/folder\?with=ik-static$/.test(url)) {
+      return jsonResponse({
+        result: "success",
+        data: [
+          { id: "inbox-id", name: "Inbox", role: "inbox", children: [] },
+          { id: "archive-id", name: "Archives", role: "archive", children: [] },
+        ],
+      });
+    }
+    const listing = listings.find((entry) => entry.match(url));
+    if (listing) {
+      return jsonResponse({ result: "success", data: { count: listing.count ?? listing.threads.length, threads: listing.threads } });
+    }
+    throw new Error(`Unexpected URL ${url}`);
+  };
+  return { calls, fetchImpl };
+}
+
+const oneMailbox = [{ uuid: "mailbox-1", email: "user@example.com", mailbox: "user" }];
+
+test("MailApiService query sends sender, text and attachment filters to the server", async () => {
+  const { calls, fetchImpl } = queryFetch({
+    mailboxes: oneMailbox,
+    listings: [{
+      match: (url) => url.includes("/mail/mailbox-1/folder/inbox-id/message?"),
+      threads: [thread("1", "Re: eLTS", "2026-06-02T10:00:00Z", { from: "ada@example.com", preview: "body match only" })],
+    }],
+  });
+
+  const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
+  const result = await mail.queryMessages({ folder: "Inbox", sender: "@example.com", query: "Rechnung", hasAttachment: true, limit: 5 });
+
+  const listUrl = calls.find((url) => url.includes("/message?"));
+  assert.ok(listUrl.includes("&sfrom=example.com"), `domain without @: ${listUrl}`);
+  assert.ok(listUrl.includes("&scontains=Rechnung"), `full-text on the server: ${listUrl}`);
+  assert.ok(listUrl.includes("&sattachments=yes"), `attachments on the server: ${listUrl}`);
+  assert.ok(listUrl.includes("severywhere=0"), `single folder: ${listUrl}`);
+  assert.equal(result.messages.length, 1, "server-side body match is kept even though preview does not contain the query");
+});
+
+test("MailApiService query stops paging once messages are older than date_from", async () => {
+  const { calls, fetchImpl } = queryFetch({
+    mailboxes: oneMailbox,
+    listings: [{
+      match: (url) => url.includes("/mail/mailbox-1/folder/inbox-id/message?offset=0&"),
+      count: 500,
+      threads: [
+        thread("1", "New", "2026-06-02T10:00:00Z"),
+        thread("2", "Old", "2026-05-20T10:00:00Z"),
+      ],
+    }],
+  });
+
+  const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
+  const result = await mail.queryMessages({ folder: "Inbox", dateFrom: "2026-06-01", limit: 10 });
+
+  assert.deepEqual(result.messages.map((message) => message.subject), ["New"]);
+  assert.equal(result.nextCursor, undefined);
+  assert.equal(calls.filter((url) => url.includes("/message?")).length, 1);
+});
+
+test("MailApiService query searches all folders in one call and collapses duplicates", async () => {
+  const { calls, fetchImpl } = queryFetch({
+    mailboxes: oneMailbox,
+    listings: [{
+      match: (url) => url.includes("/mail/mailbox-1/folder/inbox-id/message?") && url.includes("severywhere=1"),
+      threads: [
+        thread("1", "Invoice", "2026-06-02T10:00:00Z", { folderId: "inbox-id", folder: "INBOX", msgId: "<dup@example.com>" }),
+        thread("7", "Invoice", "2026-06-02T10:00:00Z", { folderId: "archive-id", folder: "Archives", msgId: "<dup@example.com>" }),
+        thread("2", "Reply", "2026-06-01T10:00:00Z", { folderId: "sent-id", folder: "Sent" }),
+      ],
+    }],
+  });
+
+  const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
+  const result = await mail.queryMessages({ allFolders: true, limit: 10 });
+
+  assert.equal(result.allFolders, true);
+  assert.equal(calls.filter((url) => url.includes("/message?")).length, 1);
+  assert.deepEqual(
+    result.messages.map((message) => [message.uid, message.folderPath]),
+    [["1@inbox-id", "INBOX"], ["2@sent-id", "Sent"]]
+  );
+  assert.equal(result.messages[0].messageId, "<dup@example.com>");
+});
+
+test("MailApiService query merges several mailboxes sorted by date", async () => {
+  const { fetchImpl } = queryFetch({
+    mailboxes: [
+      { uuid: "mailbox-1", email: "user@example.com", mailbox: "user" },
+      { uuid: "mailbox-2", email: "shared@example.com", mailbox: "shared" },
+    ],
+    listings: [
+      {
+        match: (url) => url.includes("/mail/mailbox-1/folder/inbox-id/message?"),
+        threads: [thread("1", "Mine", "2026-06-01T10:00:00Z")],
+      },
+      {
+        match: (url) => url.includes("/mail/mailbox-2/folder/inbox-id/message?"),
+        threads: [thread("9", "Shared", "2026-06-02T10:00:00Z")],
+      },
+    ],
+  });
+
+  const mail = new MailApiService({ token: "secret-token", fetch: fetchImpl });
+  const all = await mail.queryMessages({ allMailboxes: true, limit: 10 });
+  assert.deepEqual(all.messages.map((message) => [message.subject, message.mailboxUuid]), [["Shared", "mailbox-2"], ["Mine", "mailbox-1"]]);
+  assert.deepEqual(all.mailboxes.map((entry) => [entry.mailboxUuid, entry.total]), [["mailbox-1", 1], ["mailbox-2", 1]]);
+  assert.equal(all.total, 2);
+
+  const some = await mail.queryMessages({ mailboxUuids: ["mailbox-2"], limit: 10 });
+  assert.deepEqual(some.messages.map((message) => message.subject), ["Shared"]);
+  assert.deepEqual(some.mailboxes.map((entry) => entry.mailboxUuid), ["mailbox-2"]);
 });

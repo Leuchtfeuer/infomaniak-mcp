@@ -44,6 +44,35 @@ interface Reminder {
   minutes_before: number;
 }
 
+export interface ListEventsOptions {
+  calendarId?: string;
+  allCalendars?: boolean;
+  query?: string;
+  fields?: string[];
+}
+
+export interface CompactEvent {
+  id: string;
+  calendar_id?: string | number;
+  title: string;
+  start: string;
+  end: string;
+  fullday?: boolean;
+  location?: string;
+  description?: string;
+  description_truncated?: boolean;
+  status: string | null;
+  organizer: string | null;
+  attendees: Array<Pick<Attendee, "address" | "name" | "state" | "organizer">>;
+  my_response: string | null;
+  rrule?: string | null;
+  recurrence_id?: unknown;
+  has_video_conference_link?: boolean;
+  meet_room_url?: string | null;
+}
+
+const COMPACT_DESCRIPTION_MAX_CHARS = 400;
+
 export class CalendarService {
   private api: InfomaniakAPI;
   private timezone: string | null = null;
@@ -82,21 +111,44 @@ export class CalendarService {
     return calendars;
   }
 
-  async listEvents(from: string, to: string, calendarId?: string): Promise<CalendarEvent[]> {
-    const calendars = calendarId
-      ? [{ id: calendarId }]
-      : await this.listCalendars();
+  async listEvents(from: string, to: string, options: ListEventsOptions = {}): Promise<Array<CompactEvent | Record<string, unknown>>> {
+    const calendars = options.calendarId
+      ? [{ id: options.calendarId }]
+      : options.allCalendars
+        ? await this.listCalendars()
+        : [await this.defaultCalendar()];
 
     const eventGroups = await Promise.all(calendars.map(async (cal) => {
       const res = (await this.api.get("/1/calendar/pim/event", {
         calendar_id: String(cal.id),
         from: formatDateForApi(from),
         to: formatDateForApi(to),
+        with: "attendees",
       })) as ApiResponse;
       return (res.data ?? []) as CalendarEvent[];
     }));
 
-    return eventGroups.flat();
+    const query = options.query?.trim().toLowerCase();
+    const events = eventGroups.flat().filter((event) => !query || eventMatchesQuery(event, query));
+    if (options.fields?.length) {
+      return events.map((event) => pickFields(event, options.fields!));
+    }
+    const { email } = await this.getUserProfile();
+    return events.map((event) => compactEvent(event, email));
+  }
+
+  async getEvent(eventId: string): Promise<CalendarEvent> {
+    const res = (await this.api.get(`/1/calendar/pim/event/${eventId}`)) as ApiResponse;
+    return res.data as CalendarEvent;
+  }
+
+  private async defaultCalendar(): Promise<Calendar> {
+    const calendars = await this.listCalendars();
+    const calendar = calendars.find((entry) => entry.default === true) ?? calendars[0];
+    if (!calendar) {
+      throw new Error("No calendars found.");
+    }
+    return calendar;
   }
 
   async createEvent(params: {
@@ -166,7 +218,7 @@ export class CalendarService {
     clearReminders?: boolean;
   }): Promise<CalendarEvent> {
     const { timezone } = await this.getUserProfile();
-    const current = await this.findEventById(eventId);
+    const current = await this.getEvent(eventId);
 
     const body: Record<string, unknown> = {
       title: normalizeString(params.title ?? current.title, current.title, "Untitled"),
@@ -194,34 +246,47 @@ export class CalendarService {
     return res.data as CalendarEvent;
   }
 
-  private async findEventById(eventId: string): Promise<CalendarEvent> {
-    const calendars = await this.listCalendars();
-    const now = new Date();
+}
 
-    for (let step = 0; step <= 24; step += 1) {
-      const candidateStarts = step === 0
-        ? [addMonths(now, -1)]
-        : [addMonths(now, -1 - step * 3), addMonths(now, -1 + step * 3)];
+function eventMatchesQuery(event: CalendarEvent, query: string): boolean {
+  return [event.title, event.description, event.location]
+    .some((value) => typeof value === "string" && value.toLowerCase().includes(query));
+}
 
-      for (const windowStart of candidateStarts) {
-        const windowEnd = addMonths(windowStart, 3);
-        for (const calendar of calendars) {
-          const res = (await this.api.get("/1/calendar/pim/event", {
-            calendar_id: String(calendar.id),
-            from: formatDateForApi(windowStart.toISOString()),
-            to: formatDateForApi(windowEnd.toISOString()),
-          })) as ApiResponse;
-          const events = (res.data ?? []) as CalendarEvent[];
-          const event = events.find((entry) => String(entry.id) === eventId);
-          if (event) {
-            return event;
-          }
-        }
-      }
-    }
-
-    throw new Error(`Event ${eventId} not found`);
+function pickFields(event: CalendarEvent, fields: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = { id: event.id };
+  for (const field of fields) {
+    if (field in event) picked[field] = event[field];
   }
+  return picked;
+}
+
+function compactEvent(event: CalendarEvent, userEmail: string): CompactEvent {
+  const attendees = (event.attendees ?? []).map(({ address, name, state, organizer }) => ({ address, name, state, organizer }));
+  const own = attendees.find((attendee) => attendee.address.toLowerCase() === userEmail.toLowerCase());
+  const description = typeof event.description === "string" ? event.description : "";
+  const compact: CompactEvent = {
+    id: event.id,
+    calendar_id: event.calendar_id,
+    title: event.title,
+    start: event.start,
+    end: event.end,
+    fullday: event.fullday,
+    location: typeof event.location === "string" ? event.location : undefined,
+    description: description.slice(0, COMPACT_DESCRIPTION_MAX_CHARS),
+    status: typeof event.status === "string" ? event.status : null,
+    organizer: typeof event.organizer === "string" ? event.organizer : null,
+    attendees,
+    my_response: own?.state ?? null,
+    rrule: event.rrule,
+    recurrence_id: event.recurrence_id,
+    has_video_conference_link: event.has_video_conference_link as boolean | undefined,
+    meet_room_url: event.meet_room_url as string | null | undefined,
+  };
+  if (description.length > COMPACT_DESCRIPTION_MAX_CHARS) {
+    compact.description_truncated = true;
+  }
+  return compact;
 }
 
 /**
@@ -257,12 +322,6 @@ function formatDateForApi(dateStr: string): string {
 
   // Last resort: pass through and let the API handle it
   return dateStr;
-}
-
-function addMonths(date: Date, months: number): Date {
-  const copy = new Date(date);
-  copy.setMonth(copy.getMonth() + months);
-  return copy;
 }
 
 function normalizeOptionalString(value: unknown): string | undefined {

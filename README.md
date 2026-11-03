@@ -494,7 +494,8 @@ Requires: `INFOMANIAK_TOKEN`
 | Tool | Description |
 |------|-------------|
 | `calendar_list_calendars` | List all available calendars |
-| `calendar_list_events` | List events in a date range (ISO 8601 dates) |
+| `calendar_list_events` | List compact events in a date range with organizer, attendees and `my_response`; own calendar by default, `all_calendars`, `query` and `fields` optional |
+| `calendar_get_event` | Get one event by ID with all fields |
 | `calendar_create_event` | Create a new event with optional attendees, RRULE recurrence, and reminder offsets |
 | `calendar_update_event` | Update an existing event, including recurrence/reminder changes or clears |
 | `calendar_delete_event` | Delete a calendar event; requires exact confirmation |
@@ -503,14 +504,14 @@ Requires: `INFOMANIAK_TOKEN`
 
 Requires: `MAIL_TOKEN` with `workspace:mail` scope for API-backed mailbox/folder/message query, metadata reads, attachment download/sending, search, draft saving with attachments, folder management, sender cleanup, spam cleanup, filter listing, and single-message move/delete/flag. Also set `MAIL_USER` + `MAIL_PASSWORD` for IMAP/SMTP fallback.
 
-`mail_query` uses the Mail API's message-list summaries with local filtering and anchored cursors. The public Infomaniak API reference currently documents mailbox search, but not a user-mailbox indexed message-search endpoint.
+`mail_query` uses the Mail API's message-list summaries with anchored cursors. `sender`, `query` (full text over subject and body) and `has_attachment=true` are applied by the server over the whole folder; `unread`, `flagged` and the date bounds are checked locally, and `date_from` ends paging once older mail is reached. `all_folders` searches the mailbox in one call, `all_mailboxes` or `mailbox_uuids` merge several mailboxes.
 
 | Tool | Description |
 |------|-------------|
 | `mail_list_mailboxes` | List mailboxes available to the Mail API token |
 | `mail_list_folders` | List all mail folders (INBOX, Sent, Drafts, etc.) |
 | `mail_list_messages` | List messages in a folder (newest first, paginated) |
-| `mail_query` | Query message summaries with filters and an opaque `nextCursor` |
+| `mail_query` | Query message summaries with server-side sender/text/attachment filters, an opaque `nextCursor`, optional `all_folders` and multi-mailbox queries |
 | `mail_read_message` | Read one email; defaults to metadata only, with opt-in body/header/thread fields |
 | `mail_download_attachment` | Save a specific attachment to a temp file by default, or return inline base64 for small attachments |
 | `mail_search` | Search by subject, body, or sender |

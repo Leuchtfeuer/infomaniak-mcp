@@ -47,6 +47,8 @@ const mailMessageSummarySchema = z.object({
   hasAttachments: z.boolean().optional(),
   folderId: z.string().optional(),
   folderPath: z.string().optional(),
+  messageId: z.string().optional(),
+  mailboxUuid: z.string().optional(),
 });
 
 const mailQueryOutputSchema = {
@@ -58,6 +60,14 @@ const mailQueryOutputSchema = {
   total: z.number(),
   scannedCount: z.number(),
   nextCursor: z.string().optional(),
+  allFolders: z.boolean().optional(),
+  mailboxes: z.array(z.object({
+    mailboxUuid: z.string(),
+    mailboxEmail: z.string().optional(),
+    total: z.number(),
+    scannedCount: z.number(),
+    nextCursor: z.string().optional(),
+  })).optional(),
 };
 
 type ToolAnnotations = {
@@ -148,16 +158,19 @@ export function registerMailTools(server: McpServer, mail: MailToolService, opti
     registerMailTool(
       server,
       "mail_query",
-      "Query message summaries with server-side paging semantics. Returns concise metadata only; use mail_read_message with include_body when a specific message body is needed.",
+      "Query message summaries with server-side paging semantics. sender, query and has_attachment=true are applied by the server over the whole folder; date_from ends paging once older mail is reached. Returns concise metadata only; use mail_read_message with include_body when a specific message body is needed.",
       {
         mailbox_uuid: z.string().optional().describe("Optional Infomaniak mailbox UUID when using the Mail API backend"),
+        mailbox_uuids: z.array(z.string()).optional().describe("Query these mailboxes in one call (limit applies per mailbox; results are merged by date, per-mailbox cursors in mailboxes[])."),
+        all_mailboxes: z.boolean().optional().describe("Query every mailbox from mail_list_mailboxes in one call."),
         folder: z.string().optional().describe("Folder path or folder_id:<id>. Defaults to INBOX. Ignored when cursor is provided."),
-        query: z.string().optional().describe("Text to match against UID, subject, sender, and preview."),
-        sender: z.string().optional().describe("Full sender email or @domain filter."),
+        all_folders: z.boolean().optional().describe("Search every folder of the mailbox in one call; each message carries its folderId/folderPath and copies in several folders are collapsed."),
+        query: z.string().optional().describe("Server-side full-text search over subject and body."),
+        sender: z.string().optional().describe("Full sender email or @domain filter, applied by the server."),
         unread: z.boolean().optional().describe("Filter unread/read messages."),
         flagged: z.boolean().optional().describe("Filter starred/flagged messages."),
         has_attachment: z.boolean().optional().describe("Filter messages with attachments when the backend exposes that metadata."),
-        date_from: z.string().optional().describe("Inclusive lower date bound, ISO 8601 date or date-time."),
+        date_from: z.string().optional().describe("Inclusive lower date bound, ISO 8601 date or date-time. Paging stops once messages are older."),
         date_to: z.string().optional().describe("Inclusive upper date bound, ISO 8601 date or date-time."),
         limit: z.number().int().min(1).max(100).optional().describe("Maximum summaries to return (default: 20, max: 100)."),
         cursor: z.string().optional().describe("Opaque nextCursor returned by a previous mail_query call."),
@@ -165,7 +178,10 @@ export function registerMailTools(server: McpServer, mail: MailToolService, opti
       readOnly,
       async (args) => jsonResult(await mail.queryMessages!({
         mailboxUuid: args.mailbox_uuid,
+        mailboxUuids: args.mailbox_uuids,
+        allMailboxes: args.all_mailboxes,
         folder: args.folder,
+        allFolders: args.all_folders,
         query: args.query,
         sender: args.sender,
         unread: args.unread,

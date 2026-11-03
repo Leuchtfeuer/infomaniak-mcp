@@ -74,6 +74,7 @@ interface RawAddress {
 
 interface RawThreadMessage {
   uid?: MailUid;
+  msg_id?: string;
   date?: string;
   from?: RawAddress[];
   preview?: string;
@@ -81,6 +82,8 @@ interface RawThreadMessage {
   seen?: boolean;
   flagged?: boolean;
   has_attachments?: boolean;
+  folder_id?: string;
+  folder?: string;
 }
 
 interface RawThread {
@@ -252,10 +255,14 @@ export class MailApiService implements Partial<MailToolService> {
   }
 
   async queryMessages(params: MailQueryParams): Promise<MailQueryResult> {
+    if (params.allMailboxes || params.mailboxUuids?.length) {
+      return this.queryAcrossMailboxes(params);
+    }
     const cursor = params.cursor ? decodeMailQueryCursor(params.cursor) : undefined;
     const mailbox = await this.resolveMailbox(params.mailboxUuid ?? cursor?.mailboxUuid);
     const limit = clampInt(params.limit ?? cursor?.limit ?? 20, 1, 100);
     const filters = cursor?.filters ?? normalizeQueryFilters(params);
+    const allFolders = cursor ? cursor.allFolders === true : params.allFolders === true;
     const folderRef = cursor
       ? { id: cursor.folderId, path: cursor.folderPath }
       : await this.resolveFolderRef(mailbox.uuid, params.folder ?? "INBOX");
@@ -265,18 +272,24 @@ export class MailApiService implements Partial<MailToolService> {
     let total = Number.POSITIVE_INFINITY;
     let scannedCount = 0;
     let stoppedWithMoreMatches = false;
+    let olderThanDateFrom = false;
     let anchorDate = cursor?.anchorDate;
     const seenMessageKeys = new Set(cursor?.seenMessageKeys ?? []);
     const messages: MailMessageSummary[] = [];
 
     while (messages.length < limit && offset < total) {
-      const batch = await this.listMessagesAtOffset(mailbox.uuid, folderRef.id, pageSize, offset);
+      const batch = await this.listMessagesAtOffset(mailbox.uuid, folderRef.id, pageSize, offset, {
+        everywhere: allFolders,
+        serverFilters: serverFilterQuery(filters),
+      });
       total = batch.total;
       scannedCount += batch.messages.length;
       anchorDate ??= batch.messages[0]?.date;
 
       for (const message of batch.messages) {
-        const enriched = { ...message, folderId: folderRef.id, folderPath: folderRef.path };
+        const enriched = allFolders && message.folderId
+          ? message
+          : { ...message, folderId: folderRef.id, folderPath: folderRef.path };
         const key = mailMessageKey(enriched);
         if (anchorDate && isAfterAnchor(enriched.date, anchorDate)) {
           continue;
@@ -295,11 +308,17 @@ export class MailApiService implements Partial<MailToolService> {
       }
 
       if (batch.messages.length === 0) break;
+      // The listing is sorted newest first, so once a page ends before date_from nothing older can match.
+      const oldest = batch.messages[batch.messages.length - 1];
+      if (filters.dateFrom && !stoppedWithMoreMatches && Date.parse(oldest.date) < Date.parse(filters.dateFrom)) {
+        olderThanDateFrom = true;
+        break;
+      }
       offset += pageSize;
       if (messages.length >= limit) break;
     }
 
-    const nextCursor = (stoppedWithMoreMatches || offset < total)
+    const nextCursor = !olderThanDateFrom && (stoppedWithMoreMatches || offset < total)
       ? encodeMailQueryCursor({
           version: MAIL_QUERY_CURSOR_VERSION,
           mailboxUuid: mailbox.uuid,
@@ -310,10 +329,11 @@ export class MailApiService implements Partial<MailToolService> {
           filters,
           anchorDate,
           seenMessageKeys: [...seenMessageKeys],
+          allFolders: allFolders || undefined,
         })
       : undefined;
 
-    return {
+    const result: MailQueryResult = {
       mailboxUuid: mailbox.uuid,
       mailboxEmail: mailbox.email,
       folderId: folderRef.id,
@@ -322,6 +342,34 @@ export class MailApiService implements Partial<MailToolService> {
       total: Number.isFinite(total) ? total : messages.length,
       scannedCount,
       nextCursor,
+    };
+    if (allFolders) result.allFolders = true;
+    return result;
+  }
+
+  private async queryAcrossMailboxes(params: MailQueryParams): Promise<MailQueryResult> {
+    const mailboxes = await this.listMailboxes();
+    const wanted = params.mailboxUuids?.length ? new Set(params.mailboxUuids) : undefined;
+    const selected = wanted ? mailboxes.filter((mailbox) => wanted.has(mailbox.uuid)) : mailboxes;
+    if (selected.length === 0) {
+      throw new Error("No matching Infomaniak mailboxes found.");
+    }
+    const results = await mapWithConcurrency(selected, DEFAULT_FOLDER_SCAN_CONCURRENCY, (mailbox) =>
+      this.queryMessages({ ...params, mailboxUuid: mailbox.uuid, allMailboxes: undefined, mailboxUuids: undefined, cursor: undefined })
+    );
+    const messages = results
+      .flatMap((result) => result.messages.map((message) => ({ ...message, mailboxUuid: result.mailboxUuid })))
+      .sort((left, right) => Date.parse(right.date) - Date.parse(left.date));
+    return {
+      mailboxUuid: results[0].mailboxUuid,
+      mailboxEmail: results[0].mailboxEmail,
+      folderId: results[0].folderId,
+      folderPath: results[0].folderPath,
+      messages,
+      total: results.reduce((sum, result) => sum + result.total, 0),
+      scannedCount: results.reduce((sum, result) => sum + result.scannedCount, 0),
+      allFolders: results[0].allFolders,
+      mailboxes: results.map(({ mailboxUuid, mailboxEmail, total, scannedCount, nextCursor }) => ({ mailboxUuid, mailboxEmail, total, scannedCount, nextCursor })),
     };
   }
 
@@ -792,10 +840,11 @@ export class MailApiService implements Partial<MailToolService> {
     mailboxUuid: string,
     folderId: string,
     limit: number,
-    offset: number
+    offset: number,
+    options: { everywhere?: boolean; serverFilters?: string } = {}
   ): Promise<MailListMessagesResult> {
     const response = await this.apiRequest<{ count?: number; total?: number; threads?: RawThread[] }>(
-      `/mail/${encodeURIComponent(mailboxUuid)}/folder/${encodeURIComponent(folderId)}/message?offset=${offset}&thread=on&severywhere=0&limit=${limit}`
+      `/mail/${encodeURIComponent(mailboxUuid)}/folder/${encodeURIComponent(folderId)}/message?offset=${offset}&thread=on&severywhere=${options.everywhere ? 1 : 0}&limit=${limit}${options.serverFilters ?? ""}`
     );
     const threads = response.data?.threads ?? [];
     const messages = threads.map(mapThread);
@@ -1267,6 +1316,11 @@ function mapThread(thread: RawThread): MailMessageSummary {
   if (latestMessage?.date && latestMessage.date !== thread.date) {
     message.lastMessageDate = latestMessage.date;
   }
+  if (latestMessage?.msg_id) message.messageId = latestMessage.msg_id;
+  if (latestMessage?.folder_id) {
+    message.folderId = latestMessage.folder_id;
+    message.folderPath = latestMessage.folder;
+  }
   const seen = latestMessage?.seen ?? thread.seen;
   const flagged = latestMessage?.flagged ?? thread.flagged;
   const hasAttachments = latestMessage?.has_attachments ?? thread.has_attachments;
@@ -1303,11 +1357,12 @@ interface MailQueryCursor {
   filters: MailQueryFilters;
   anchorDate?: string;
   seenMessageKeys?: string[];
+  allFolders?: boolean;
 }
 
 function normalizeQueryFilters(params: MailQueryParams): MailQueryFilters {
   return {
-    query: params.query?.trim().toLowerCase() || undefined,
+    query: params.query?.trim() || undefined,
     sender: params.sender ? normalizeSenderCriteria(params.sender) : undefined,
     unread: params.unread,
     flagged: params.flagged,
@@ -1318,9 +1373,7 @@ function normalizeQueryFilters(params: MailQueryParams): MailQueryFilters {
 }
 
 function matchesQueryFilters(message: MailMessageSummary, filters: MailQueryFilters): boolean {
-  if (filters.query && !messageMatchesQuery(message, filters.query)) {
-    return false;
-  }
+  // filters.query is applied by the server (scontains) and may match only in the body.
   if (filters.sender && !matchesSender(message.from, filters.sender)) {
     return false;
   }
@@ -1332,7 +1385,8 @@ function matchesQueryFilters(message: MailMessageSummary, filters: MailQueryFilt
     const isFlagged = message.flagged === true || message.flags.includes("\\Flagged");
     if (isFlagged !== filters.flagged) return false;
   }
-  if (filters.hasAttachment !== undefined && Boolean(message.hasAttachments) !== filters.hasAttachment) {
+  // hasAttachment=true is applied by the server (sattachments=yes); only the negative needs a local check.
+  if (filters.hasAttachment === false && message.hasAttachments === true) {
     return false;
   }
   if (filters.dateFrom && Date.parse(message.date) < Date.parse(filters.dateFrom)) {
@@ -1354,7 +1408,20 @@ function messageMatchesQuery(message: MailMessageSummary, normalizedQuery: strin
 }
 
 function mailMessageKey(message: MailMessageSummary): string {
-  return `${message.folderId ?? ""}:${String(message.uid)}`;
+  // The Message-ID collapses copies of one mail that live in several folders.
+  return message.messageId ?? `${message.folderId ?? ""}:${String(message.uid)}`;
+}
+
+// Filters the Mail API applies itself: sfrom takes a full address or a bare domain,
+// scontains searches subject and body, sattachments=yes keeps only mails with attachments.
+function serverFilterQuery(filters: MailQueryFilters): string {
+  const params: string[] = [];
+  if (filters.sender) {
+    params.push(`sfrom=${encodeURIComponent(filters.sender.kind === "domain" ? filters.sender.value.slice(1) : filters.sender.value)}`);
+  }
+  if (filters.query) params.push(`scontains=${encodeURIComponent(filters.query)}`);
+  if (filters.hasAttachment === true) params.push("sattachments=yes");
+  return params.length ? `&${params.join("&")}` : "";
 }
 
 function isAfterAnchor(messageDate: string, anchorDate: string): boolean {
